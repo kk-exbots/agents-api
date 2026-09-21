@@ -81,7 +81,11 @@ export function redact(text) {
 /* ---------- 4. audit log ---------- */
 let pool = null;
 if (process.env.DATABASE_URL) {
-  pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  const url = process.env.DATABASE_URL;
+  const internal = /railway\.internal|localhost|127\.0\.0\.1/.test(url);
+  pool = new pg.Pool({ connectionString: url, ssl: internal ? false : { rejectUnauthorized: false } });
+  pool.on("error", (e) => console.error("pg pool error:", e.message));
+  try {
   await pool.query(`CREATE TABLE IF NOT EXISTS audit (
     id BIGSERIAL PRIMARY KEY,
     ts TIMESTAMPTZ DEFAULT now(),
@@ -89,6 +93,11 @@ if (process.env.DATABASE_URL) {
     model_id TEXT, redacted BOOLEAN, input_chars INT, output_chars INT,
     latency_ms INT, status TEXT, error TEXT
   )`);
+  console.log("audit log: postgres");
+  } catch (e) {
+    console.error("postgres unavailable, falling back to file log:", e.message);
+    pool = null;
+  }
 }
 const FILE = path.join(process.cwd(), "data", "audit.jsonl");
 
