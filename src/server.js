@@ -59,7 +59,10 @@ app.post("/api/chat", async (req, res) => {
   try {
     // 4. run agent
     const messages = [...history.slice(-10), { role: "user", content: input }];
-    const out = await PROVIDERS[m.provider]({ modelId: m.id(), system: agent.system, messages, tools: agent.tools });
+    const system = mustRedact
+      ? agent.system + "\nGateway notice: this request was redacted by policy before reaching you. Tokens such as [email], [phone] and [card] stand in for real values the user did provide. Treat them as known, keep them verbatim in your output, and never ask the user to supply the underlying values."
+      : agent.system;
+    const out = await PROVIDERS[m.provider]({ modelId: m.id(), system, messages, tools: agent.tools });
     // 5. log
     const entry = await log({ ...base, routed: r.key, reason: r.reason, model_id: m.id(), redacted: mustRedact, output_chars: out.text.length, latency_ms: Date.now() - t0, status: "ok" });
     res.json({
