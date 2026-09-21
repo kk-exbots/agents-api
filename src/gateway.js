@@ -70,12 +70,31 @@ export function route(requested, tags, policy = DEFAULT_POLICY) {
   return { key, reason: "auto: lowest-cost allowed" };
 }
 
-/* ---------- redaction (v0: mask emails/phones/cards when policy says so) ---------- */
+/* ---------- pseudonymisation: swap PII for stable tokens, restore on the way out ---------- */
+const PII_PATTERNS = [
+  ["EMAIL", /\b[\w.+-]+@[\w-]+\.[\w.]+\b/g],
+  ["CARD",  /\b(?:\d[ -]*?){13,19}\b/g],
+  ["PHONE", /\b(\+?1[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/g],
+];
 export function redact(text) {
-  return text
-    .replace(/\b[\w.+-]+@[\w-]+\.[\w.]+\b/g, "[email]")
-    .replace(/\b(\+?1[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}\b/g, "[phone]")
-    .replace(/\b(?:\d[ -]*?){13,19}\b/g, "[card]");
+  const map = new Map(); // token -> real value
+  const seen = new Map(); // real value -> token
+  let out = text;
+  for (const [kind, re] of PII_PATTERNS) {
+    let n = 0;
+    out = out.replace(re, (m) => {
+      if (seen.has(m)) return seen.get(m);
+      const tok = `${kind}_${++n}`;
+      seen.set(m, tok); map.set(tok, m);
+      return tok;
+    });
+  }
+  return { text: out, map };
+}
+export function restore(text, map) {
+  let out = text;
+  for (const [tok, real] of map) out = out.split(tok).join(real);
+  return out;
 }
 
 /* ---------- 4. audit log ---------- */

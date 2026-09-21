@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
-import { classify, route, redact, log, recent, MODELS, DEFAULT_POLICY, allowedModels } from "./gateway.js";
+import { classify, route, redact, restore, log, recent, MODELS, DEFAULT_POLICY, allowedModels } from "./gateway.js";
 import { AGENTS, listAgents } from "./agents/index.js";
 
 const app = express();
@@ -24,7 +24,7 @@ async function runAnthropic({ modelId, system, messages, tools }) {
 const PROVIDERS = { anthropic: runAnthropic };
 
 /* ---------- endpoints ---------- */
-app.get("/health", (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "0.3.0", ts: new Date().toISOString() }));
 
 app.get("/api/agents", (_, res) => res.json(listAgents()));
 
@@ -54,18 +54,17 @@ app.post("/api/chat", async (req, res) => {
   }
   const m = MODELS[r.key];
   const mustRedact = tags.some((t) => DEFAULT_POLICY[t]?.redact);
-  const input = mustRedact ? redact(task) : task;
+  const red = mustRedact ? redact(task) : { text: task, map: new Map() };
+  const input = red.text;
 
   try {
     // 4. run agent
-    const userContent = mustRedact
-      ? "[Gateway: personal data in this message was masked by policy. [email], [phone] and [card] are real values the user supplied; keep the tokens verbatim and do not ask for them.]\n\n" + input
-      : input;
-    const messages = [...history.slice(-10), { role: "user", content: userContent }];
+    const messages = [...history.slice(-10), { role: "user", content: input }];
     const system = mustRedact
-      ? agent.system + "\nGateway notice: this request was redacted by policy before reaching you. Tokens such as [email], [phone] and [card] stand in for real values the user did provide. Treat them as known, keep them verbatim in your output, and never ask the user to supply the underlying values."
+      ? agent.system + "\nGateway notice: personal data in this request has been pseudonymised by policy. Identifiers such as EMAIL_1, PHONE_1 or CARD_1 are stand-ins for real values the user already supplied; the gateway restores them after you answer. Use these identifiers exactly as written wherever the real value belongs, and complete the task fully. Do not ask the user for the underlying values."
       : agent.system;
     const out = await PROVIDERS[m.provider]({ modelId: m.id(), system, messages, tools: agent.tools });
+    if (mustRedact) out.text = restore(out.text, red.map);
     // 5. log
     const entry = await log({ ...base, routed: r.key, reason: r.reason, model_id: m.id(), redacted: mustRedact, output_chars: out.text.length, latency_ms: Date.now() - t0, status: "ok" });
     res.json({
