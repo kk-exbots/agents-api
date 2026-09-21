@@ -58,7 +58,10 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     // 4. run agent
-    const messages = [...history.slice(-10), { role: "user", content: input }];
+    const userContent = mustRedact
+      ? "[Gateway: personal data in this message was masked by policy. [email], [phone] and [card] are real values the user supplied; keep the tokens verbatim and do not ask for them.]\n\n" + input
+      : input;
+    const messages = [...history.slice(-10), { role: "user", content: userContent }];
     const system = mustRedact
       ? agent.system + "\nGateway notice: this request was redacted by policy before reaching you. Tokens such as [email], [phone] and [card] stand in for real values the user did provide. Treat them as known, keep them verbatim in your output, and never ask the user to supply the underlying values."
       : agent.system;
