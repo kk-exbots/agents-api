@@ -12,19 +12,32 @@ app.use(cors({ origin: origins.includes("*") ? true : origins }));
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
 
 /* ---------- providers ---------- */
-async function runAnthropic({ modelId, system, messages, tools }) {
+function anthropicRequest({ modelId, system, messages, tools }) {
   const req = { model: modelId, max_tokens: 4000, system, messages };
   if (tools.includes("web_search")) req.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }];
-  const res = await anthropic.messages.create(req);
+  return req;
+}
+// Streaming variant: calls onText(delta) as tokens arrive, resolves with the same shape as runAnthropic.
+async function streamAnthropic({ modelId, system, messages, tools }, onText) {
+  const stream = anthropic.messages.stream(anthropicRequest({ modelId, system, messages, tools }));
+  stream.on("text", (t) => onText(t));
+  const res = await stream.finalMessage();
+  const text = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  const searches = res.content.filter((b) => b.type === "server_tool_use").length;
+  return { text, searches, usage: res.usage };
+}
+async function runAnthropic({ modelId, system, messages, tools }) {
+  const res = await anthropic.messages.create(anthropicRequest({ modelId, system, messages, tools }));
   const text = res.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
   const searches = res.content.filter((b) => b.type === "server_tool_use").length;
   return { text, searches, usage: res.usage };
 }
 // Placeholders until keys exist: the router never selects a disabled provider.
 const PROVIDERS = { anthropic: runAnthropic };
+const STREAMERS = { anthropic: streamAnthropic };
 
 /* ---------- endpoints ---------- */
-app.get("/health", (_, res) => res.json({ ok: true, version: "0.3.0", ts: new Date().toISOString() }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "0.4.0", ts: new Date().toISOString() }));
 
 app.get("/api/agents", (_, res) => res.json(listAgents()));
 
@@ -78,6 +91,60 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+
+/* ---------- streaming (SSE) ----------
+   Same pipeline as /api/chat, but tokens are pushed as they arrive.
+   Events: meta (gateway decision, sent first) · delta (text chunk) · done (final) · error
+*/
+const HOLDBACK = 10; // longest pseudonym token is ~8 chars; never emit a partial one
+app.post("/api/chat/stream", async (req, res) => {
+  const t0 = Date.now();
+  const { agent: agentId = "chat", model: requested = "auto", task = "", history = [], tenant = "public" } = req.body || {};
+  const agent = AGENTS[agentId];
+  if (!agent) return res.status(400).json({ error: `Unknown agent: ${agentId}` });
+  if (!task.trim()) return res.status(400).json({ error: "task is required" });
+
+  const tags = classify(task);
+  const r = route(requested, tags);
+  const base = { tenant, agent: agentId, tags, requested, input_chars: task.length };
+  if (r.error) {
+    await log({ ...base, routed: null, reason: null, model_id: null, redacted: false, output_chars: 0, latency_ms: Date.now() - t0, status: "blocked", error: r.error });
+    return res.status(403).json({ error: r.error, tags, allowed: allowedModels(tags) });
+  }
+  const m = MODELS[r.key];
+  const mustRedact = tags.some((t) => DEFAULT_POLICY[t]?.redact);
+  const red = mustRedact ? redact(task) : { text: task, map: new Map() };
+
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send("meta", { agent: agentId, tags, routed: r.key, model: m.id(), region: m.region, reason: r.reason, redacted: mustRedact, approval: agent.approval ?? null });
+  const ping = setInterval(() => res.write(": ping\n\n"), 15000);
+
+  // Restore pseudonyms on the fly while holding back a small tail so a token is never split.
+  let raw = "", sent = 0;
+  const flush = (final) => {
+    const restored = mustRedact ? restore(raw, red.map) : raw;
+    const upto = final ? restored.length : Math.max(sent, restored.length - HOLDBACK);
+    if (upto > sent) { send("delta", { text: restored.slice(sent, upto) }); sent = upto; }
+  };
+
+  try {
+    const messages = [...history.slice(-10), { role: "user", content: red.text }];
+    const system = mustRedact
+      ? agent.system + "\nGateway notice: personal data in this request has been pseudonymised by policy. Identifiers such as EMAIL_1, PHONE_1 or CARD_1 are stand-ins for real values the user already supplied; the gateway restores them after you answer. Use these identifiers exactly as written wherever the real value belongs, and complete the task fully. Do not ask the user for the underlying values."
+      : agent.system;
+    const out = await STREAMERS[m.provider]({ modelId: m.id(), system, messages, tools: agent.tools }, (t) => { raw += t; flush(false); });
+    raw = out.text; flush(true);
+    const text = mustRedact ? restore(out.text, red.map) : out.text;
+    const entry = await log({ ...base, routed: r.key, reason: r.reason, model_id: m.id(), redacted: mustRedact, output_chars: text.length, latency_ms: Date.now() - t0, status: "ok" });
+    send("done", { text, searches: out.searches, latency_ms: entry.latency_ms });
+  } catch (e) {
+    await log({ ...base, routed: r.key, reason: r.reason, model_id: m.id(), redacted: mustRedact, output_chars: 0, latency_ms: Date.now() - t0, status: "error", error: String(e.message || e) });
+    send("error", { error: "Model call failed: " + (e.message || e) });
+  } finally {
+    clearInterval(ping); res.end();
+  }
+});
 
 // Railway injects PORT; bind to 0.0.0.0 so the container is reachable.
 const port = Number(process.env.PORT) || 8080;
