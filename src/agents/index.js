@@ -9,6 +9,7 @@ export const AGENTS = {
   chat: {
     name: "Chat",
     status: "live",
+    tier: "fast",
     tools: [],
     system: `${BRAND}\nYou are a capable general assistant for professionals. Answer directly, then offer one useful next step.`,
   },
@@ -55,5 +56,5 @@ Only report items you found on official or reputable sources. If nothing changed
 };
 
 export function listAgents() {
-  return Object.entries(AGENTS).map(([id, a]) => ({ id, name: a.name, status: a.status, tools: a.tools, approval: a.approval ?? null }));
+  return Object.entries(AGENTS).map(([id, a]) => ({ id, name: a.name, status: a.status, tier: a.tier ?? "quality", tools: a.tools, approval: a.approval ?? null }));
 }

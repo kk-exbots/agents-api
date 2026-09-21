@@ -33,6 +33,7 @@ export function classify(text) {
 /* ---------- 2. policy ---------- */
 // Each provider declares where data goes. Policy says which classes may go where.
 export const MODELS = {
+  haiku:   { id: () => process.env.MODEL_HAIKU || "claude-haiku-4-5", provider: "anthropic", region: "us", cost: 1, tier: "fast", enabled: () => !!process.env.ANTHROPIC_API_KEY },
   claude:  { id: () => process.env.MODEL_CLAUDE || "claude-sonnet-4-6", provider: "anthropic", region: "us", cost: 3, enabled: () => !!process.env.ANTHROPIC_API_KEY },
   gpt:     { id: () => process.env.MODEL_GPT || "gpt-5", provider: "openai", region: "us", cost: 3, enabled: () => !!process.env.OPENAI_API_KEY },
   gemini:  { id: () => process.env.MODEL_GEMINI || "gemini-2.5-pro", provider: "google", region: "us", cost: 2, enabled: () => !!process.env.GOOGLE_API_KEY },
@@ -42,10 +43,10 @@ export const MODELS = {
 
 // Default tenant policy (v0). Later this comes from the tenant's config.
 export const DEFAULT_POLICY = {
-  general:      { allow: ["claude", "gpt", "gemini", "mistral", "onprem"] },
-  confidential: { allow: ["claude", "gpt", "mistral", "onprem"] },
-  financial:    { allow: ["claude", "mistral", "onprem"] },
-  pii:          { allow: ["claude", "onprem"], redact: true },
+  general:      { allow: ["haiku", "claude", "gpt", "gemini", "mistral", "onprem"] },
+  confidential: { allow: ["haiku", "claude", "gpt", "mistral", "onprem"] },
+  financial:    { allow: ["haiku", "claude", "mistral", "onprem"] },
+  pii:          { allow: ["haiku", "claude", "onprem"], redact: true },
 };
 
 export function allowedModels(tags, policy = DEFAULT_POLICY) {
@@ -56,7 +57,7 @@ export function allowedModels(tags, policy = DEFAULT_POLICY) {
 }
 
 /* ---------- 3. route ---------- */
-export function route(requested, tags, policy = DEFAULT_POLICY) {
+export function route(requested, tags, policy = DEFAULT_POLICY, tier = "quality") {
   const allowed = allowedModels(tags, policy).filter((m) => MODELS[m].enabled());
   if (!allowed.length) return { error: "No enabled model satisfies policy for tags: " + tags.join(", ") };
   if (requested && requested !== "auto") {
@@ -65,9 +66,12 @@ export function route(requested, tags, policy = DEFAULT_POLICY) {
     }
     return { key: requested, reason: "requested" };
   }
-  // auto = cheapest allowed
-  const key = allowed.sort((a, b) => MODELS[a].cost - MODELS[b].cost)[0];
-  return { key, reason: "auto: lowest-cost allowed" };
+  // auto = cheapest allowed within the agent's tier: "fast" agents may use fast models,
+  // "quality" agents never drop to a fast model.
+  const pool_ = tier === "fast" ? allowed : allowed.filter((m) => MODELS[m].tier !== "fast");
+  const candidates = pool_.length ? pool_ : allowed;
+  const key = candidates.sort((a, b) => MODELS[a].cost - MODELS[b].cost)[0];
+  return { key, reason: `auto: lowest-cost allowed (${tier})` };
 }
 
 /* ---------- pseudonymisation: swap PII for stable tokens, restore on the way out ---------- */
@@ -98,7 +102,7 @@ export function restore(text, map) {
 }
 
 /* ---------- 4. audit log ---------- */
-let pool = null;
+export let pool = null;
 if (process.env.DATABASE_URL) {
   const url = process.env.DATABASE_URL;
   const internal = /railway\.internal|localhost|127\.0\.0\.1/.test(url);
@@ -112,6 +116,12 @@ if (process.env.DATABASE_URL) {
     model_id TEXT, redacted BOOLEAN, input_chars INT, output_chars INT,
     latency_ms INT, status TEXT, error TEXT
   )`);
+  await pool.query(`ALTER TABLE audit
+    ADD COLUMN IF NOT EXISTS ip TEXT,
+    ADD COLUMN IF NOT EXISTS input_tokens INT,
+    ADD COLUMN IF NOT EXISTS output_tokens INT,
+    ADD COLUMN IF NOT EXISTS searches INT,
+    ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(10,5)`);
   console.log("audit log: postgres");
   } catch (e) {
     console.error("postgres unavailable, falling back to file log:", e.message);
@@ -124,10 +134,11 @@ export async function log(row) {
   const entry = { ts: new Date().toISOString(), ...row };
   if (pool) {
     await pool.query(
-      `INSERT INTO audit (tenant,agent,tags,requested,routed,reason,model_id,redacted,input_chars,output_chars,latency_ms,status,error)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      `INSERT INTO audit (tenant,agent,tags,requested,routed,reason,model_id,redacted,input_chars,output_chars,latency_ms,status,error,ip,input_tokens,output_tokens,searches,cost_usd)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       [entry.tenant, entry.agent, entry.tags, entry.requested, entry.routed, entry.reason, entry.model_id,
-       entry.redacted, entry.input_chars, entry.output_chars, entry.latency_ms, entry.status, entry.error ?? null]
+       entry.redacted, entry.input_chars, entry.output_chars, entry.latency_ms, entry.status, entry.error ?? null,
+       entry.ip ?? null, entry.input_tokens ?? null, entry.output_tokens ?? null, entry.searches ?? 0, entry.cost_usd ?? 0]
     );
   } else {
     fs.mkdirSync(path.dirname(FILE), { recursive: true });
